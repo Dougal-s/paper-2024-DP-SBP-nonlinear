@@ -18,6 +18,7 @@ set_theme!(hpdes_makie_theme)
 
 const f = 7.292e-5
 const g = 9.80616
+const ω_colorrange = (-3.0e-5 + f, 3.0e-5 + f)
 
 # An instability caused by a velocity difference across the interface
 # between two fluids
@@ -92,8 +93,10 @@ allopts = dict_list(Dict(
     )
     s₀ = meshgrid.(state0, Ref.(xs)...)
 
-    ∂x(m) = ∂x2D(Dx₋ + Dx₊, m)
-    ∂y(m) = ∂y2D(Dy₋ + Dy₊, m)
+    Dx = (Dx₋ + Dx₊) / 2
+    Dy = (Dy₋ + Dy₊) / 2
+    ∂x(m) = ∂x2D(Dx, m)
+    ∂y(m) = ∂y2D(Dy, m)
     vorticity((h, u, v)) = ∂x(v) .- ∂y(u) .+ f
 
     pde! = semidiscretise(pdeinfo, xs, ((Dx₊, Dx₋), (Dy₊, Dy₋)))
@@ -172,7 +175,7 @@ for opts in allopts
         )
         hm = heatmap!(ax, xs ./ 1e6, ys ./ 1e6, ω,
             colormap = :seismic,
-            colorrange = (-6.0e-5 + f, 6.0e-5 + f),
+            colorrange = ω_colorrange,
             rasterize = 4
         )
         Colorbar(fig[1, 2], hm, label = L"ω")
@@ -196,7 +199,7 @@ for opts in allopts
         )
         hm = heatmap!(ax, xs ./ 1e6, ys ./ 1e6, ω,
             colormap = :seismic,
-            colorrange = (-6.0e-5 + f, 6.0e-5 + f)
+            colorrange = ω_colorrange
         )
         Colorbar(fig[:, end + 1], hm, label = L"ω")
         resize_to_layout!(fig)
@@ -236,7 +239,7 @@ let comparison_ts = [
             )
             hm = heatmap!(ax, xs ./ 1e6, ys ./ 1e6, ω,
                 colormap = :seismic,
-                colorrange = (-6.0e-5 + f, 6.0e-5 + f),
+                colorrange = ω_colorrange,
                 rasterize = 4
             )
         end

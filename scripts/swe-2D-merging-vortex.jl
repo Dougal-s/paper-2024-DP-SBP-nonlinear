@@ -20,6 +20,7 @@ set_theme!(hpdes_makie_theme)
 const f = 5.0 # coriolis
 const g = 5.0 # gravity
 const H = 8.0 # base height
+const PV_colorrange = (-0.3, 0.9)
 
 # The collision and merging of two vortices
 const testname   = "merging-vortex"
@@ -102,8 +103,10 @@ allopts = dict_list(Dict(
     )
     s₀ = meshgrid.(state0, Ref.(xs)...)
 
-    ∂x(m) = ∂x2D(Dx₋ + Dx₊, m)
-    ∂y(m) = ∂y2D(Dy₋ + Dy₊, m)
+    Dx = (Dx₋ + Dx₊) / 2
+    Dy = (Dy₋ + Dy₊) / 2
+    ∂x(m) = ∂x2D(Dx, m)
+    ∂y(m) = ∂y2D(Dy, m)
     vorticity((h, u, v)) = ∂x(v) .- ∂y(u) .+ f
 
     pde! = semidiscretise(pdeinfo, xs, ((Dx₊, Dx₋), (Dy₊, Dy₋)))
@@ -196,7 +199,7 @@ for opts in allopts
         )
         hm = heatmap!(ax, xs, ys, pv,
             colormap = :seaborn_icefire_gradient,
-            colorrange = (-1.2, 1.2),
+            colorrange = PV_colorrange,
             rasterize = 4
         )
         Colorbar(fig[1, 2], hm, label = L"\frac{ω}{h}")
@@ -240,7 +243,7 @@ for opts in allopts
         )
         hm = heatmap!(ax, xs, ys, pv,
             colormap = :seaborn_icefire_gradient, #:seismic,
-            colorrange = (-1.2, 1.2)
+            colorrange = PV_colorrange
         )
         Colorbar(fig[:, end + 1], hm, label = L"\frac{ω}{h}")
         resize_to_layout!(fig)
@@ -359,7 +362,7 @@ let comparison_ts = [
             )
             hm = heatmap!(ax, xs, ys, pv,
                 colormap = :seaborn_icefire_gradient,
-                colorrange = (-1.2, 1.2),
+                colorrange = PV_colorrange,
                 rasterize = 4
             )
         end
