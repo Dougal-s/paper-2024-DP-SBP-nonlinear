@@ -1,0 +1,5 @@
+[deps]
+HyperbolicPDEs = "2ecfde92-62e8-4bce-9476-c6f614a5cd5d"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SummationByPartsOperators = "9f78cca6-572e-554e-b819-917d2f1cf240"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

@@ -1,8 +1,12 @@
-using Symbolics
-using Base.Threads
 using LinearAlgebra
+using LoopVectorization: @turbo
+using MuladdMacro: @muladd
 
-import Base: *
+export MemoryPool
+export returnblocks, getblock
+
+export axis_mul!
+export add_splitting!
 
 mutable struct MemoryPool{T, Dims}
     blocks::Vector{T}
@@ -41,80 +45,87 @@ end
 # derivatives
 # Extends 1D derivative operators to 2D dimensions
 
-function ∂y2D!(dst, D, m; cache = similar(m))
-    permutedims!(dst, m, (2, 1))
-    permutedims!(dst, ∂x2D!(cache, D, dst), (2, 1))
-    dst
-end
+"""
+    axis_mul!(dst::AbstractArray, ::Val{N}, D, m::AbstractArray, cache)
 
-function ∂x2D!(dst, D, m)
-    @inbounds for i in axes(m, 2)
+Applies the operator `D` along the `N`-th dimension of the array `m` and stores
+the result in dst.
+"""
+function axis_mul!(
+        dst::AbstractArray{T, M},
+        ::Val{1},
+        D,
+        m::AbstractArray{T, M},
+        _...
+) where {T, M}
+    @inbounds for i in CartesianIndices(size(m)[2:M])
         @views mul!(dst[:, i], D, m[:, i])
     end
     dst
+end,
+function axis_mul!(
+        dst::AbstractArray{T, M},
+        ::Val{N},
+        D,
+        m::AbstractArray{T, M},
+        cache
+) where {N, T, M}
+    @assert 2 ≤ N ≤ M
+    σ₁ᴺ = (N, (2:(N - 1))..., 1, (N + 1):M...)
+    @turbo cache .= PermutedDimsArray(m, σ₁ᴺ)
+    axis_mul!(PermutedDimsArray(dst, σ₁ᴺ), Val(1), D, cache)
+    dst
 end
 
-function ∂y2D(mempool::MemoryPool, D, m; cache = getblock(mempool))
-    ∂y2D!(getblock(mempool), D, m; cache = cache)
-end
-∂x2D(mempool::MemoryPool, D, m) = ∂x2D!(getblock(mempool), D, m)
+"""
+    axis_mul!(mempool::MemoryPool, args...)
 
-∂y2D(D, m) = ∂y2D!(similar(m), D, m)
-∂x2D(D, m) = ∂x2D!(similar(m), D, m)
+Allocates a temporary array using `dst` and forwards the argument to `axis_mul!`.
+"""
+axis_mul!(mempool::MemoryPool, args...) = axis_mul!(getblock(mempool), args...)
 
-#
-finitemaximum(f, it) = maximum(Iterators.filter(isfinite, Iterators.map(f, it)))
 
-# Symbolic Utilities
+add_splitting!(dst::AbstractArray, dim::Val{1}, grid, Diᵥ, Diₛ, λs, m, tmp) =
+    add_splitting!(dst, dim, grid, Diᵥ, Diₛ, λs, m, tmp, nothing)
 
-# Used to emulate ∇
-struct VectorOperator
-    scale::Number
-    ops::Vector{Any}
-end
+# Global upwinding
+# function add_splitting!(
+#         dst::AbstractArray,
+#         dim::Val,
+#         grid,
+#         Diᵥ, Diₛ,
+#         λs,
+#         m,
+#         tmp, permute_cache
+#     )
+#     axis_mul!(tmp, dim, Diᵥ + Diₛ, m, permute_cache)
+#     λ = @fastmath(maximum)(λs)
+#     @. dst = muladd(λ, tmp, dst)
+# end
 
-VectorOperator(ops::AbstractVector) = VectorOperator(1, ops)
-
-Base.getindex(op::VectorOperator, i::Int64) = op.ops[i]
-
-(op::VectorOperator)(x::Number) = op.scale * map(f -> f(x), op.ops)
-
-*(x::Number, op::VectorOperator) = VectorOperator(x * op.scale, op.ops)
-
-function LinearAlgebra.dot(op::VectorOperator, v::AbstractVector)
-    op.scale * sum(((f, vᵢ),) -> f(vᵢ), zip(op.ops, v))
-end
-
-LinearAlgebra.dot(op::VectorOperator, m::AbstractMatrix) = [op ⋅ v for v in eachrow(m)]
-
-function make_source_modifier_from_syms(
-        statevars::Tuple,
-        source_terms::Dict,
-        grid
-)
-    if !(grid isa Tuple)
-        grid = tuple(grid)
+# Local upwinding
+function add_splitting!(
+        dst::AbstractArray,
+        dim::Val,
+        grid,
+        Diᵥ, Diₛ,
+        λs,
+        m,
+        tmp,
+        permute_cache
+    )
+    axis_mul!(tmp, dim, Diᵥ, m, permute_cache)
+    @inbounds foreachelement(grid) do I
+        λ = @fastmath(maximum)(view(λs, I))
+        @views @. dst[I] = muladd(λ, tmp[I], dst[I])
     end
-
-    source_terms_expr = Dict(zip(
-        keys(source_terms),
-        map(Symbolics.toexpr ∘ simplify ∘ expand_derivatives, values(source_terms))
-    ))
-
-    add_source_terms! = eval(quote
-        (ds, t::Real) -> begin
-            for (i, x) in enumerate(Iterators.product($(grid...)))
-                $(Expr(:block,
-                    map(statevars) do var
-                        :(ds.$var[i] += $(source_terms_expr[var]))
-                    end...))
-            end
-            return nothing
+    axis_mul!(tmp, dim, Diₛ, m, permute_cache)
+    @inbounds foreachinterface(grid, dim) do I₋, I₊
+        for (i₋, i₊) in zip(I₋, I₊)
+            λ = @fastmath(max)(λs[i₋], λs[i₊])
+            dst[i₋] = muladd(λ, tmp[i₋], dst[i₋])
+            dst[i₊] = muladd(λ, tmp[i₊], dst[i₊])
         end
-    end)
-
-    return (ds, s, t::Real, _...) -> begin
-        @invokelatest add_source_terms!(ds, t)
-        return nothing
     end
 end
+

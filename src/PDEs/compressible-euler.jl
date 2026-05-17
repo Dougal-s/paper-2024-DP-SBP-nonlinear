@@ -1,354 +1,503 @@
-include("../pde-utils.jl")
 include("compressible-euler-core.jl")
 
 using NaNMath
-using StaticArrays
 using UnPack
+using StaticArrays
+using LinearAlgebra
+using MuladdMacro: @muladd
 
-function semidiscretise(info::CompEulerFluxForm2D{T}, s₀, Dx₊, Dx₋, Dy₊, Dy₋) where {T}
-    @unpack γ, flux_splitting = info
+@muladd begin
+    function semidiscretise(info::CompEulerFluxForm2D{T}, grid, fdop;
+            alloc = () -> Array{T}(undef, size(grid))
+    ) where {T}
+        @unpack γ = info
 
-    Dx = (Dx₋ + Dx₊) / 2
-    Dx_split = (Dx₋ - Dx₊) / 2
+        mempool = MemoryPool(alloc())
+        permute_cache = alloc()
 
-    Dy = (Dy₋ + Dy₊) / 2
-    Dy_split = (Dy₋ - Dy₊) / 2
+        Dx = (@unpack D, B = fdop[1]; D + B)
+        ∂x(m) = axis_mul!(mempool, Val(1), Dx, m, permute_cache)
 
-    mempool = MemoryPool(T, size(s₀[1]))
-    ∂y(m) = ∂y2D(mempool, Dy, m)
-    ∂ys(m) = ∂y2D(mempool, Dy_split, m)
-    ∂x(m) = ∂x2D(mempool, Dx, m)
-    ∂xs(m) = ∂x2D(mempool, Dx_split, m)
+        Dy = (@unpack D, B = fdop[2]; D + B)
+        ∂y(m) = axis_mul!(mempool, Val(2), Dy, m, permute_cache)
 
-    add_dissipation! = make_dissipation(info, flux_splitting, s₀, (∂xs, ∂ys))
+        apply_modifier!s = map(
+            mod -> make_modifier(info, mod, grid, fdop, alloc, mempool), info.modifiers)
 
-    ϱ⁻¹ = similar(s₀[1])
-    u = similar(s₀[1])
-    v = similar(s₀[1])
-    p = similar(s₀[1])
+        ϱ⁻¹ = alloc()
+        u   = alloc()
+        v   = alloc()
+        p   = alloc()
 
-    # fluxes
-    ϱuv = similar(s₀[1])
-    fϱux = similar(s₀[1])
-    fϱex = similar(s₀[1])
-    fϱvy = similar(s₀[1])
-    fϱey = similar(s₀[1])
+        # fluxes
+        ϱuv  = alloc()
+        fϱux = alloc()
+        fϱex = alloc()
+        fϱvy = alloc()
+        fϱey = alloc()
 
-    (ds, s, _, t) -> begin
-        @unpack ϱ, ϱu, ϱv, ϱe = s
-        returnblocks(mempool)
+        (ds, s, _, t) -> begin
+            @unpack ϱ, ϱu, ϱv, ϱe = s
+            returnblocks(mempool)
 
-        @. ϱ⁻¹ = one(T) / ϱ
-        @. u = ϱu * ϱ⁻¹
-        @. v = ϱv * ϱ⁻¹
-        @. ϱuv = ϱu * ϱv * ϱ⁻¹
-        @. p = (γ - 1) * (ϱe - 1 // 2 * (ϱu * u + ϱv * v))
+            @inbounds @simd ivdep for i in eachindex(ϱ)
+                ϱᵢ, ϱv⃗ᵢ, ϱeᵢ = ϱ[i], @SArray[ϱu[i], ϱv[i]], ϱe[i]
 
-        @. fϱux = ϱu * u + p
-        @. fϱex = u * (ϱe + p)
+                ϱ⁻¹ᵢ = inv(ϱᵢ)
+                v⃗ᵢ = ϱv⃗ᵢ * ϱ⁻¹ᵢ
+                ϱv⃗v⃗ᵢ = ϱv⃗ᵢ * v⃗ᵢ'
+                pᵢ = (γ - 1) * (ϱeᵢ - 1 // 2 * tr(ϱv⃗v⃗ᵢ))
 
-        @. fϱvy = ϱv * v + p
-        @. fϱey = v * (ϱe + p)
+                # fluxes
+                fϱux[i], ϱuv[i], _, fϱvy[i] = ϱv⃗v⃗ᵢ + pᵢ * I
+                fϱex[i], fϱey[i] = v⃗ᵢ * (ϱeᵢ + pᵢ)
 
-        ds.ϱ .= @. -$∂x(ϱu) - $∂y(ϱv)
-        ds.ϱu .= @. -$∂x(fϱux) - $∂y(ϱuv)
-        ds.ϱv .= @. -$∂x(ϱuv) - $∂y(fϱvy)
-        ds.ϱe .= @. -$∂x(fϱex) - $∂y(fϱey)
+                # intermediate qtys
+                ϱ⁻¹[i], u[i], v[i], p[i] = ϱ⁻¹ᵢ, v⃗ᵢ..., pᵢ
+            end
 
-        add_dissipation!(ds, (s, ϱ⁻¹, u, v, p))
+            ds.ϱ  .= @. -$∂x(ϱu) - $∂y(ϱv)
+            ds.ϱu .= @. -$∂x(fϱux) - $∂y(ϱuv)
+            ds.ϱv .= @. -$∂x(ϱuv) - $∂y(fϱvy)
+            ds.ϱe .= @. -$∂x(fϱex) - $∂y(fϱey)
+
+            for apply_mod! in apply_modifier!s
+                apply_mod!(ds, s, t, (; ϱ⁻¹ = ϱ⁻¹, u = u, v = v, p = p))
+            end
+        end
     end
-end
 
-function make_dissipation(eqs::CompEulerFluxForm2D{T}, ::FluxLaxFriedrichs, _, (∂xs, ∂ys)) where {T}
-    @unpack γ = eqs
-    (ds, (s, ϱ⁻¹, u, v, p)) -> begin
-        @unpack ϱ, ϱu, ϱv, ϱe = s
-        λx = zero(T)
-        λy = zero(T)
-        @inbounds for i in eachindex(ϱ)
-            a = √max(γ * p[i] * ϱ⁻¹[i], zero(T))
-            λx = max(λx, abs(u[i]) + a)
-            λy = max(λy, abs(v[i]) + a)
+    function make_modifier(
+            eqs::CompEulerFluxForm2D{T},
+            splitting::FluxLaxFriedrichs,
+            grid,
+            fdop,
+            alloc,
+            mempool
+    ) where {T}
+        @unpack γ = eqs
+
+        Dixᵥ = (splitting.volume ? splitting.scaling * fdop[1].Diᵥ : NullOperator())
+        Dixₛ = (splitting.surface ? splitting.scaling * fdop[1].Diₛ : NullOperator())
+        Diyᵥ = (splitting.volume ? splitting.scaling * fdop[2].Diᵥ : NullOperator())
+        Diyₛ = (splitting.surface ? splitting.scaling * fdop[2].Diₛ : NullOperator())
+
+        permute_cache = alloc()
+        tmp = alloc()
+
+        λs = ntuple(_ -> alloc(), 2)
+
+        (ds, s, t, diagnostic) -> begin
+            @unpack ϱ, ϱu, ϱv, ϱe = s
+            @unpack ϱ⁻¹, u, v, p = diagnostic
+
+            @inbounds for i in eachindex(ϱ)
+                a = NaNMath.sqrt(γ * p[i] * ϱ⁻¹[i])
+                λs[1][i] = abs(u[i]) + a
+                λs[2][i] = abs(v[i]) + a
+            end
+
+            for (dqdt, q, λs) in (
+                (ds.ϱ, ϱ, λs),
+                (ds.ϱu, ϱu, λs),
+                (ds.ϱv, ϱv, λs),
+                (ds.ϱe, ϱe, λs),
+            )
+                add_splitting!(dqdt, Val(1), grid, Dixᵥ, Dixₛ, λs[1], q, tmp, permute_cache)
+                add_splitting!(dqdt, Val(2), grid, Diyᵥ, Diyₛ, λs[2], q, tmp, permute_cache)
+            end
+        end
+    end
+
+    function make_modifier(
+            eqs::CompEulerFluxForm2D{T},
+            splitting::FluxVanLeerHanel,
+            grid,
+            fdop,
+            alloc,
+            mempool
+    ) where {T}
+        @unpack γ = eqs
+
+        permute_cache = alloc()
+        Dxₛ = splitting.scaling * ((splitting.volume ? fdop[1].Diᵥ : NullOperator()) +
+                                   (splitting.surface ? fdop[1].Diₛ : NullOperator()))
+        ∂xs(m) = axis_mul!(mempool, Val(1), Dxₛ, m, permute_cache)
+
+        Dyₛ = splitting.scaling * ((splitting.volume ? fdop[2].Diᵥ : NullOperator()) +
+                                   (splitting.surface ? fdop[2].Diₛ : NullOperator()))
+        ∂ys(m) = axis_mul!(mempool, Val(2), Dyₛ, m, permute_cache)
+
+        pₛ = alloc()
+        a  = alloc()
+        M  = alloc()
+        fₛ = ntuple(_ -> alloc(), Val(4))
+
+        (ds, s, t, diagnostic) -> begin
+            @unpack ϱ, ϱu, ϱv, ϱe = s
+            @unpack ϱ⁻¹, u, v, p = diagnostic
+
+            @. a = NaNMath.sqrt(γ * p * ϱ⁻¹)
+
+            @. M     = u / a
+            @. pₛ    = γ * M * p
+            @. fₛ[1] = ϱ * a * (M^2 + 1) / 2
+            @. fₛ[2] = fₛ[1] * u + pₛ
+            @. fₛ[3] = fₛ[1] * v
+            @. fₛ[4] = fₛ[1] * (ϱe + p) * ϱ⁻¹
+
+            @. ds.ϱ  += $∂xs(fₛ[1])
+            @. ds.ϱu += $∂xs(fₛ[2])
+            @. ds.ϱv += $∂xs(fₛ[3])
+            @. ds.ϱe += $∂xs(fₛ[4])
+
+            @. M     = v / a
+            @. pₛ    = γ * M * p
+            @. fₛ[1] = ϱ * a * (M^2 + 1) / 2
+            @. fₛ[2] = fₛ[1] * u
+            @. fₛ[3] = fₛ[1] * v + pₛ
+            @. fₛ[4] = fₛ[1] * (ϱe + p) * ϱ⁻¹
+
+            @. ds.ϱ  += $∂ys(fₛ[1])
+            @. ds.ϱu += $∂ys(fₛ[2])
+            @. ds.ϱv += $∂ys(fₛ[3])
+            @. ds.ϱe += $∂ys(fₛ[4])
+
+            nothing
+        end
+    end
+
+    function semidiscretise(info::NordstromCompEuler2D{T}, grid, fdop;
+            alloc = () -> Array{T}(undef, size(grid))
+    ) where {T}
+        @unpack γ = info
+
+        dims = 2
+        allocn(n) = ntuple(_ -> alloc(), n)
+
+        mempool = MemoryPool(alloc())
+        permute_cache = alloc()
+
+        Dx = (@unpack D, B = fdop[1]; D + B)
+        ∂x!(dst, m) = axis_mul!(dst, Val(1), Dx, m, permute_cache)
+
+        Dy = (@unpack D, B = fdop[2]; D + B)
+        ∂y!(dst, m) = axis_mul!(dst, Val(2), Dy, m, permute_cache)
+
+        tmp = alloc()
+        function gradient!(x, y, src)
+            ∂x!(x, src)
+            ∂y!(y, src)
+        end
+        function divergence!(dst, x, y)
+            ∂x!(dst, x)
+            ∂y!(tmp, y)
+            @. dst += tmp
         end
 
-        ds.ϱ .+= @. -λx * $∂xs(ϱ) - λy * $∂ys(ϱ)
-        ds.ϱu .+= @. -λx * $∂xs(ϱu) - λy * $∂ys(ϱu)
-        ds.ϱv .+= @. -λx * $∂xs(ϱv) - λy * $∂ys(ϱv)
-        ds.ϱe .+= @. -λx * $∂xs(ϱe) - λy * $∂ys(ϱe)
+        apply_modifier!s = map(
+            mod -> make_modifier(info, mod, grid, fdop, alloc, mempool), info.modifiers)
 
-        nothing
-    end
-end
+        ϕ⁻¹           = alloc()
+        u, v          = allocn(Val(dims))
+        ϕuu, ϕuv, ϕvv = allocn(Val(dims * (dims+1) ÷ 2))
+        qu, qv        = allocn(Val(dims))
 
-function semidiscretise(info::NordstromCompEuler2D{T}, s₀, Dx₊, Dx₋, Dy₊, Dy₋) where {T}
-    @unpack γ, flux_splitting = info
+        ∂x_ϕ, ∂y_ϕ   = allocn(Val(dims))
+        ∂x_q, ∂y_q   = allocn(Val(dims))
+        ∂x_ϕu, ∂y_ϕu = allocn(Val(dims))
+        ∂x_ϕv, ∂y_ϕv = allocn(Val(dims))
 
-    Dx = (Dx₋ + Dx₊) / 2
-    Dx_split = (Dx₋ - Dx₊) / 2
+        div_qv⃗ = alloc()
+        div_ϕuv⃗, div_ϕvv⃗ = allocn(Val(dims))
 
-    Dy = (Dy₋ + Dy₊) / 2
-    Dy_split = (Dy₋ - Dy₊) / 2
+        (ds, s, _, t) -> begin
+            @unpack ϕ, ϕu, ϕv, q = s
+            returnblocks(mempool)
 
-    mempool = MemoryPool(T, size(s₀[1]))
-    ∂y(m) = ∂y2D(mempool, Dy, m)
-    ∂x(m) = ∂x2D(mempool, Dx, m)
-    ∂ys(m) = ∂y2D(mempool, Dy_split, m)
-    ∂xs(m) = ∂x2D(mempool, Dx_split, m)
+            @inbounds @simd ivdep for i in eachindex(ϕ)
+                ϕᵢ, ϕv⃗ᵢ, qᵢ = ϕ[i], @SVector[ϕu[i], ϕv[i]], q[i]
 
-    add_dissipation! = make_dissipation(info, flux_splitting, s₀, (∂xs, ∂ys))
+                ϕ⁻¹ᵢ = inv(ϕᵢ)
+                v⃗ᵢ = ϕv⃗ᵢ * ϕ⁻¹ᵢ
 
-    ϕ⁻¹ = similar(s₀[1])
-    u = similar(s₀[1])
-    v = similar(s₀[1])
-    ϕuu = similar(s₀[1])
-    ϕuv = similar(s₀[1])
-    ϕvv = similar(s₀[1])
-    qu = similar(s₀[1])
-    qv = similar(s₀[1])
+                ϕ⁻¹[i] = ϕ⁻¹ᵢ
+                u[i], v[i] = v⃗ᵢ
+                ϕuu[i], ϕuv[i], _, ϕvv[i] = ϕv⃗ᵢ * v⃗ᵢ'
+                qu[i], qv[i] = qᵢ * v⃗ᵢ
+            end
 
-    ∂x_ϕu = similar(s₀[1])
-    ∂y_ϕu = similar(s₀[1])
-    ∂x_ϕv = similar(s₀[1])
-    ∂y_ϕv = similar(s₀[1])
-    ∂x_q = similar(s₀[1])
-    ∂y_q = similar(s₀[1])
+            gradient!(∂x_ϕ, ∂y_ϕ, ϕ)
+            gradient!(∂x_q, ∂y_q, q)
+            gradient!(∂x_ϕu, ∂y_ϕu, ϕu)
+            gradient!(∂x_ϕv, ∂y_ϕv, ϕv)
+            divergence!(div_qv⃗, qu, qv)
+            divergence!(div_ϕuv⃗, ϕuu, ϕuv)
+            divergence!(div_ϕvv⃗, ϕuv, ϕvv)
 
-    (ds, s, _, t) -> begin
-        @unpack ϕ, ϕu, ϕv, q = s
-        returnblocks(mempool)
+            @inbounds @simd ivdep for i in eachindex(ϕ)
+                ϕ⁻¹ᵢ, qᵢ   = ϕ⁻¹[i], q[i]
+                v⃗ᵢ         = @SArray[u[i], v[i]]
+                ∇⃗ϕᵢ        = @SArray[∂x_ϕ[i], ∂y_ϕ[i]]
+                ∇⃗qᵢ        = @SArray[∂x_q[i], ∂y_q[i]]
+                ∇⃗ϕv⃗ᵢ       = @SArray[∂x_ϕu[i] ∂x_ϕv[i]; ∂y_ϕu[i] ∂y_ϕv[i]]
+                div_ϕv⃗v⃗ᵢ   = @SArray[div_ϕuv⃗[i], div_ϕvv⃗[i]]
+                div_qv⃗ᵢ    = div_qv⃗[i]
 
-        @. ϕ⁻¹ = one(T) / ϕ
+                ds.ϕ[i]            = -1 // 2 * (∇⃗ϕᵢ ⋅ v⃗ᵢ + tr(∇⃗ϕv⃗ᵢ))
+                ds.ϕu[i], ds.ϕv[i] = -1 // 2 * (∇⃗ϕv⃗ᵢ' * v⃗ᵢ + div_ϕv⃗v⃗ᵢ) - 2qᵢ * ϕ⁻¹ᵢ * ∇⃗qᵢ
+                ds.q[i]            = -1 // 2 * (γ * div_qv⃗ᵢ + (2 - γ) * (∇⃗qᵢ ⋅ v⃗ᵢ))
+            end
 
-        @. u = ϕu * ϕ⁻¹
-        @. v = ϕv * ϕ⁻¹
-
-        @. ϕuu = ϕu * u
-        @. ϕuv = ϕu * v
-        @. ϕvv = ϕv * v
-
-        @. qu = q * u
-        @. qv = q * v
-
-        ∂x2D!(∂x_ϕu, Dx, ϕu)
-        ∂y2D!(∂y_ϕu, Dy, ϕu; cache=getblock(mempool))
-        ∂x2D!(∂x_ϕv, Dx, ϕv)
-        ∂y2D!(∂y_ϕv, Dy, ϕv; cache=getblock(mempool))
-        ∂x2D!(∂x_q, Dx, q)
-        ∂y2D!(∂y_q, Dy, q; cache=getblock(mempool))
-
-        # Entropy: ϕα^2
-        ds.ϕ .= @. -1 // 2 * (u * $∂x(ϕ) + ∂x_ϕu + v * $∂y(ϕ) + ∂y_ϕv)
-
-        # Entropy: (γ-1)/2 * ϕu
-        ds.ϕu .= @. -1 // 2 * (
-            (u * ∂x_ϕu + $∂x(ϕuu)) + (v * ∂y_ϕu + $∂y(ϕuv)) +
-            4q * ϕ⁻¹ * ∂x_q
-        )
-
-        # Entropy: (γ-1)/2 * ϕv
-        ds.ϕv .= @. -1 // 2 * (
-            (u * ∂x_ϕv + $∂x(ϕuv)) + (v * ∂y_ϕv + $∂y(ϕvv)) +
-            4q * ϕ⁻¹ * ∂y_q
-        )
-
-        # Entropy: q
-        ds.q .= @. -1 // 2 * (
-            γ * ($∂x(qu) + $∂y(qv)) +
-            (2 - γ) * (u * ∂x_q + v * ∂y_q)
-        )
-
-        add_dissipation!(ds, (s, ϕ⁻¹, u, v))
-        nothing
-    end
-end
-
-function make_dissipation(eqs::NordstromCompEuler2D{T}, splitting::FluxEntropyStable, _, (∂xs, ∂ys)) where {T}
-    @unpack γ = eqs
-    @unpack scaling = splitting
-
-    sqrtγ = √(γ)
-    (ds, (s, ϕ⁻¹, u, v)) -> begin
-        @unpack ϕ, ϕu, ϕv, q = s
-
-        λϕx = zero(T)
-        λϕy = zero(T)
-        λϕux = zero(T)
-        λϕuy = zero(T)
-        λϕvx = zero(T)
-        λϕvy = zero(T)
-        λqx = zero(T)
-        λqy = zero(T)
-
-        @inbounds for i in eachindex(u)
-            ϕa = sqrtγ * abs(q[i])
-            ϕeigvalx = abs(ϕu[i]) + ϕa
-            ϕeigvaly = abs(ϕv[i]) + ϕa
-
-            λϕx = max(λϕx, ϕeigvalx)
-            λϕy = max(λϕy, ϕeigvaly)
-            λϕux = max(λϕux, ϕ[i] * ϕeigvalx)
-            λϕuy = max(λϕuy, ϕ[i] * ϕeigvaly)
-            λϕvx = max(λϕvx, ϕ[i] * ϕeigvalx)
-            λϕvy = max(λϕvy, ϕ[i] * ϕeigvaly)
-            λqx = max(λqx, ϕ⁻¹[i] * ϕeigvalx)
-            λqy = max(λqy, ϕ⁻¹[i] * ϕeigvaly)
+            for apply_mod! in apply_modifier!s
+                apply_mod!(ds, s, t, (; ϕ⁻¹ = ϕ⁻¹, u = u, v = v))
+            end
         end
-
-        λϕx *= 1 // 4 * scaling
-        λϕy *= 1 // 4 * scaling
-        λϕux *= 1 // 2 * scaling
-        λϕuy *= 1 // 2 * scaling
-        λϕvx *= 1 // 2 * scaling
-        λϕvy *= 1 // 2 * scaling
-        λqx *= 1 // 4 * scaling
-        λqy *= 1 // 4 * scaling
-
-        # Entropy: ϕα^2
-        ds.ϕ .+= @. -(λϕx * $∂xs(ϕ) + λϕy * $∂ys(ϕ)) * ϕ⁻¹
-
-        # Entropy: (γ-1)/2 * ϕu
-        ds.ϕu .+= @. -(
-            (λϕux * ϕ⁻¹ - λϕx) * $∂xs(u) +
-            (λϕuy * ϕ⁻¹ - λϕy) * $∂ys(u) +
-            (λϕx * $∂xs(ϕu) + λϕy * $∂ys(ϕu)) * ϕ⁻¹
-        )
-
-        # Entropy: (γ-1)/2 * ϕv
-        ds.ϕv .+= @. -(
-            (λϕvx * ϕ⁻¹ - λϕx) * $∂xs(v) +
-            (λϕvy * ϕ⁻¹ - λϕy) * $∂ys(v) +
-            (λϕx * $∂xs(ϕv) + λϕy * $∂ys(ϕv)) * ϕ⁻¹
-        )
-
-        # Entropy: q
-        ds.q .+= @. -λqx * $∂xs(q) - λqy * $∂ys(q)
-
-        nothing
     end
-end
 
-function semidiscretise(info::ReissSesterhennCompEuler2D{T}, s₀, Dx₊, Dx₋, Dy₊, Dy₋) where {T}
-    @unpack γ, flux_splitting = info
+    function make_modifier(
+            eqs::NordstromCompEuler2D{T},
+            splitting::FluxDSL2024,
+            _,
+            fdop,
+            alloc,
+            mempool
+    ) where {T}
+        @unpack γ = eqs
+        permute_cache = alloc()
 
-    Dx = (Dx₋ + Dx₊) / 2
-    Dx_split = (Dx₋ - Dx₊) / 2
+        Dxₛ = splitting.scaling * ((splitting.volume ? fdop[1].Diᵥ : NullOperator()) +
+                                   (splitting.surface ? fdop[1].Diₛ : NullOperator()))
+        ∂xs(m) = axis_mul!(mempool, Val(1), Dxₛ, m, permute_cache)
 
-    Dy = (Dy₋ + Dy₊) / 2
-    Dy_split = (Dy₋ - Dy₊) / 2
+        Dyₛ = splitting.scaling * ((splitting.volume ? fdop[2].Diᵥ : NullOperator()) +
+                                   (splitting.surface ? fdop[2].Diₛ : NullOperator()))
+        ∂ys(m) = axis_mul!(mempool, Val(2), Dyₛ, m, permute_cache)
 
-    mempool = MemoryPool(T, size(s₀[1]))
-    ∂y(m) = ∂y2D(mempool, Dy, m)
-    ∂ys(m) = ∂y2D(mempool, Dy_split, m)
-    ∂x(m) = ∂x2D(mempool, Dx, m)
-    ∂xs(m) = ∂x2D(mempool, Dx_split, m)
+        sqrtγ = √(γ)
+        (ds, s, t, diagnostic) -> begin
+            @unpack ϕ, ϕu, ϕv, q = s
+            @unpack ϕ⁻¹, u, v = diagnostic
 
-    add_dissipation! = make_dissipation(info, flux_splitting, s₀, (∂xs, ∂ys))
+            λϕx  = zero(T)
+            λϕy  = zero(T)
+            λϕux = zero(T)
+            λϕuy = zero(T)
+            λϕvx = zero(T)
+            λϕvy = zero(T)
+            λqx  = zero(T)
+            λqy  = zero(T)
 
-    u = similar(s₀[1])
-    v = similar(s₀[1])
-    ϱu = similar(s₀[1])
-    ϱv = similar(s₀[1])
-    ϕ⁻¹ = similar(s₀[1])
+            @inbounds for i in eachindex(u)
+                ϕa = sqrtγ * abs(q[i])
+                ϕeigvalx = abs(ϕu[i]) + ϕa
+                ϕeigvaly = abs(ϕv[i]) + ϕa
 
-    (ds, s, _, t) -> begin
-        @unpack ϕ, ϕu, ϕv, p = s
-        returnblocks(mempool)
+                λϕx  = max(λϕx, ϕeigvalx)
+                λϕy  = max(λϕy, ϕeigvaly)
+                λϕux = max(λϕux, ϕ[i] * ϕeigvalx)
+                λϕuy = max(λϕuy, ϕ[i] * ϕeigvaly)
+                λϕvx = max(λϕvx, ϕ[i] * ϕeigvalx)
+                λϕvy = max(λϕvy, ϕ[i] * ϕeigvaly)
+                λqx  = max(λqx, ϕ⁻¹[i] * ϕeigvalx)
+                λqy  = max(λqy, ϕ⁻¹[i] * ϕeigvaly)
+            end
 
-        @. ϕ⁻¹ = $one(T) / ϕ
-        @. u = ϕu * ϕ⁻¹
-        @. v = ϕv * ϕ⁻¹
-        @. ϱu = ϕu * ϕ
-        @. ϱv = ϕv * ϕ
+            λϕx *= 1 // 4
+            λϕy *= 1 // 4
+            λϕux *= 1 // 2
+            λϕuy *= 1 // 2
+            λϕvx *= 1 // 2
+            λϕvy *= 1 // 2
+            λqx *= 1 // 4
+            λqy *= 1 // 4
 
-        # Entropy: none
-        ds.ϕ .= @. -1 // 2 * ($∂x(ϱu) + $∂y(ϱv)) * ϕ⁻¹
+            # Entropy Functions:
+            #     Thermodynamic Entropy : -ϱs = -ϱ (log p - γ log ϱ)
+            #     Energy                : ϱe  = p / (γ - 1) + ½ ϕ𝐮 ⋅ ϕ𝐮
 
-        # Entropy: ϕu
-        ds.ϕu .= @. -1 // 2 * (
-            ($∂x(ϕu^2 + 2p) + $∂y(ϕu * ϕv)) * ϕ⁻¹ +
-            ϕu * $∂x(u) + ϕv * $∂y(u)
-        )
+            # ∂ᵩ  ϱe = ϕα²
+            # ∂ᵩ -ϱs = 2 √ϱ (γ + γ log ϱ - log p) = 2 √ϱ (γ - s)
+            @. ds.ϕ += (λϕx * $∂xs(ϕ) + λϕy * $∂ys(ϕ)) * ϕ⁻¹
 
-        # Entropy: ϕv
-        ds.ϕv .= @. -1 // 2 * (
-            ($∂y(ϕv^2 + 2p) + $∂x(ϕu * ϕv)) * ϕ⁻¹ +
-            ϕu * $∂x(v) + ϕv * $∂y(v)
-        )
+            # ∂ᵩᵤ  ϱe = ½ ϕu
+            # ∂ᵩᵤ -ϱs = 0
+            @. ds.ϕu += (
+                ((λϕux - λϕx * ϕ) * $∂xs(u) + λϕx * $∂xs(ϕu)) +
+                ((λϕuy - λϕy * ϕ) * $∂ys(u) + λϕy * $∂ys(ϕu))
+            ) * ϕ⁻¹
 
-        # Entropy: 1 / (γ - 1)
-        ds.p .= @. (γ - 1) * (u * $∂x(p) + v * $∂y(p)) - γ * ($∂x(p * u) + $∂y(p * v))
+            @. ds.ϕv += (
+                ((λϕvx - λϕx * ϕ) * $∂xs(v) + λϕx * $∂xs(ϕv)) +
+                ((λϕvy - λϕy * ϕ) * $∂ys(v) + λϕy * $∂ys(ϕv))
+            ) * ϕ⁻¹
 
-        add_dissipation!(ds, (s, ϕ⁻¹, u, v))
-        nothing
+            # ∂_q  ϱe    = 2 q / (γ - 1)
+            # ∂_q -ϱs    = -2 ϱ / q
+            @. ds.q += λqx * $∂xs(q) + λqy * $∂ys(q)
+            nothing
+        end
     end
-end
 
-function semidiscretise(info::VanLeerHanelCompEuler2D{T}, s₀, Dx₊, Dx₋, Dy₊, Dy₋) where {T}
-    @unpack γ = info
+    function make_modifier(
+            eqs::NordstromCompEuler2D{T},
+            splitting::FluxDSL2025,
+            grid,
+            fdop,
+            alloc,
+            mempool
+    ) where {T}
+        @unpack γ = eqs
+        permute_cache = alloc()
 
-    mempool = MemoryPool(T, size(s₀[1]))
-    ∂y(p, m) = @. $∂y2D(mempool, Dy₋, p) += $∂y2D(mempool, Dy₊, m)
-    ∂x(p, m) = @. $∂x2D(mempool, Dx₋, p) += $∂x2D(mempool, Dx₊, m)
+        Dixᵥ = (splitting.volume ? splitting.scaling * fdop[1].Diᵥ : NullOperator())
+        Dixₛ = (splitting.surface ? splitting.scaling * fdop[1].Diₛ : NullOperator())
 
-    u = similar(s₀[1])
-    v = similar(s₀[1])
-    p = similar(s₀[1])
-    a = similar(s₀[1])
-    H = similar(s₀[1])
-    M = similar(s₀[1])
-    p₊ = similar(s₀[1])
-    p₋ = similar(s₀[1])
+        Diyᵥ = (splitting.volume ? splitting.scaling * fdop[2].Diᵥ : NullOperator())
+        Diyₛ = (splitting.surface ? splitting.scaling * fdop[2].Diₛ : NullOperator())
 
-    fxp = @SVector [similar(s₀[1]), similar(s₀[1]), similar(s₀[1]), similar(s₀[1])]
-    fxm = @SVector [similar(s₀[1]), similar(s₀[1]), similar(s₀[1]), similar(s₀[1])]
-    fyp = @SVector [similar(s₀[1]), similar(s₀[1]), similar(s₀[1]), similar(s₀[1])]
-    fym = @SVector [similar(s₀[1]), similar(s₀[1]), similar(s₀[1]), similar(s₀[1])]
+        w_ϱ  = alloc()
+        w_ϱu = alloc()
+        w_ϱv = alloc()
+        w_ϱe = alloc()
 
-    (ds, s, _, t) -> begin
-        @unpack ϱ, ϱu, ϱv, ϱe = s
+        ∂s_ϱ = alloc()
+        ∂s_ϱu = alloc()
+        ∂s_ϱv = alloc()
+        ∂s_ϱe = alloc()
 
-        returnblocks(mempool)
-        @. u = ϱu / ϱ
-        @. v = ϱv / ϱ
-        @. p = (γ - 1) * (ϱe - 1 / 2 * (ϱu^2 + ϱv^2) / ϱ)
-        @. a = NaNMath.sqrt(γ * p / ϱ)
-        @. H = (ϱe + p) / ϱ
+        λ_ϱ  = ntuple(_ -> alloc(), Val(2))
+        λ_ϱu = ntuple(_ -> alloc(), Val(2))
+        λ_ϱv = ntuple(_ -> alloc(), Val(2))
+        λ_ϱe = ntuple(_ -> alloc(), Val(2))
 
-        # ∂x
-        @. M = u / a
+        tmp = alloc()
 
-        @. p₊ = 0.5 * (1 + γ * M) * p
-        @. p₋ = 0.5 * (1 - γ * M) * p
+        sqrtγ = √(γ)
+        @inbounds (∂ₜstate, state, t, diagnostic) -> begin
+            @unpack ϕ, ϕu, ϕv, q = state
+            @unpack ϕ⁻¹, u, v = diagnostic
 
-        @. fxp[1] = 0.25 * ϱ * a * (M + 1)^2
-        @. fxp[2] = fxp[1] * u + p₊
-        @. fxp[3] = fxp[1] * v
-        @. fxp[4] = fxp[1] * H
+            @simd ivdep for i in eachindex(ϕ)
+                ϕᵢ, ϕ⁻¹ᵢ, qᵢ = ϕ[i], ϕ⁻¹[i], q[i]
+                ϕv⃗ᵢ = @SArray[ϕu[i], ϕv[i]]
+                v⃗   = @SArray[u[i], v[i]]
 
-        @. fxm[1] = -0.25 * ϱ * a * (M - 1)^2
-        @. fxm[2] = fxm[1] * u + p₋
-        @. fxm[3] = fxm[1] * v
-        @. fxm[4] = fxm[1] * H
+                p⁻¹ = qᵢ^-2
+                p   = qᵢ^2
+                p²  = p^2
+                ϱ   = ϕᵢ^2
+                s   = 2 * (NaNMath.log(qᵢ) - γ * NaNMath.log(ϕᵢ))
+                ϱuu, ϱvv = ϕv⃗ᵢ.^2
+                K        = ϕv⃗ᵢ ⋅ ϕv⃗ᵢ / 2
 
-        @. M = v / a
+                w_ϱ[i]           = (γ - s) / (γ - 1) - K * p⁻¹
+                w_ϱu[i], w_ϱv[i] = ϕᵢ * p⁻¹ * ϕv⃗ᵢ
+                w_ϱe[i]          = -ϱ * p⁻¹
 
-        @. p₊ = 0.5 * (1 + γ * M) * p
-        @. p₋ = 0.5 * (1 - γ * M) * p
+                a  = sqrtγ * abs(qᵢ * ϕ⁻¹ᵢ)
+                λ  = @. abs(v⃗) + a
+                M² = @. 1 / γ * ϕv⃗ᵢ^2 * p⁻¹
 
-        @. fyp[1] = 0.25 * ϱ * a * (M + 1)^2
-        @. fyp[2] = fyp[1] * u
-        @. fyp[3] = fyp[1] * v + p₊
-        @. fyp[4] = fyp[1] * H
+                s_ϱ = (γ - 1) * ϱ * p² / ((γ - 1)^2 * K^2 + γ * p²)
+                s_ϱu = p² / (p + (γ - 1) * ϱuu)
+                s_ϱv = p² / (p + (γ - 1) * ϱvv)
+                s_ϱe = 1 / (γ - 1) * p² * ϕ⁻¹ᵢ^2
 
-        @. fym[1] = -0.25 * ϱ * a * (M - 1)^2
-        @. fym[2] = fym[1] * u
-        @. fym[3] = fym[1] * v + p₋
-        @. fym[4] = fym[1] * H
+                for d in 1:2
+                    λ_ϱ[d][i]  = s_ϱ * λ[d]
+                    λ_ϱu[d][i] = s_ϱu * λ[d]
+                    λ_ϱv[d][i] = s_ϱv * λ[d]
+                    λ_ϱe[d][i] = s_ϱe * λ[d] * 2M²[d] / (1 + M²[d])
+                end
+            end
 
-        ds.ϱ .= @. -$∂x(fxp[1], fxm[1]) - $∂y(fyp[1], fym[1])
-        ds.ϱu .= @. -$∂x(fxp[2], fxm[2]) - $∂y(fyp[2], fym[2])
-        ds.ϱv .= @. -$∂x(fxp[3], fxm[3]) - $∂y(fyp[3], fym[3])
-        ds.ϱe .= @. -$∂x(fxp[4], fxm[4]) - $∂y(fyp[4], fym[4])
-        nothing
+            for (∂s, w, λs) in (
+                (∂s_ϱ, w_ϱ, λ_ϱ),
+                (∂s_ϱu, w_ϱu, λ_ϱu),
+                (∂s_ϱv, w_ϱv, λ_ϱv),
+                (∂s_ϱe, w_ϱe, λ_ϱe)
+            )
+                fill!(∂s, false)
+                add_splitting!(∂s, Val(1), grid, Dixᵥ, Dixₛ, λs[1], w, tmp, permute_cache)
+                add_splitting!(∂s, Val(2), grid, Diyᵥ, Diyₛ, λs[2], w, tmp, permute_cache)
+            end
+
+            @simd ivdep for i in eachindex(ϕ)
+                ∂s_ϕ  = ∂s_ϱ[i] * ϕ⁻¹[i] / 2
+                ∂s_ϕu = (∂s_ϱu[i] - ϕu[i] * ∂s_ϕ) * ϕ⁻¹[i]
+                ∂s_ϕv = (∂s_ϱv[i] - ϕv[i] * ∂s_ϕ) * ϕ⁻¹[i]
+                ∂s_p  = (γ - 1) * (∂s_ϱe[i] - ϕu[i] * ∂s_ϕu - ϕv[i] * ∂s_ϕv)
+
+                ∂ₜstate.ϕ[i]  += ∂s_ϕ
+                ∂ₜstate.ϕu[i] += ∂s_ϕu
+                ∂ₜstate.ϕv[i] += ∂s_ϕv
+                ∂ₜstate.q[i]  += ∂s_p / (2q[i])
+            end
+            nothing
+        end
+    end
+
+    function semidiscretise(info::ReissSesterhennCompEuler2D{T}, grid, fdop;
+            alloc = () -> Array{T}(undef, size(grid))
+    ) where {T}
+        @unpack γ = info
+
+        mempool = MemoryPool(alloc())
+        permute_cache = alloc()
+
+        Dx = (@unpack D, B = fdop[1]; D + B)
+        ∂x(m) = axis_mul!(mempool, Val(1), Dx, m, permute_cache)
+
+        Dy = (@unpack D, B = fdop[2]; D + B)
+        ∂y(m) = axis_mul!(mempool, Val(2), Dy, m, permute_cache)
+
+        apply_modifier!s = map(
+            mod -> make_modifier(info, mod, grid, fdop, alloc, mempool), info.modifiers)
+
+        u   = alloc()
+        v   = alloc()
+        ϱu  = alloc()
+        ϱv  = alloc()
+        ϕ⁻¹ = alloc()
+
+        fux = alloc()
+        fvy = alloc()
+        ϱuv = alloc()
+        pu  = alloc()
+        pv  = alloc()
+
+        (ds, s, _, t) -> begin
+            @unpack ϕ, ϕu, ϕv, p = s
+            returnblocks(mempool)
+
+            @. ϕ⁻¹ = inv(ϕ)
+            @. u   = ϕu * ϕ⁻¹
+            @. v   = ϕv * ϕ⁻¹
+            @. ϱu  = ϕu * ϕ
+            @. ϱv  = ϕv * ϕ
+
+            @. pu  = pu * ϕu
+            @. fux = ϕu * ϕu + 2p
+            @. ϱuv = ϕu * ϕv
+            @. fvy = ϕv * ϕv + 2p
+
+            ds.ϕ .= @. -1 // 2 * ($∂x(ϱu) + $∂y(ϱv)) * ϕ⁻¹
+            ds.ϕu .= @. -1 // 2 * (
+                ($∂x(fux) + $∂y(ϱuv)) * ϕ⁻¹ +
+                ϕu * $∂x(u) + ϕv * $∂y(u)
+            )
+            ds.ϕv .= @. -1 // 2 * (
+                ($∂x(ϱuv) + $∂y(fvy)) * ϕ⁻¹ +
+                ϕu * $∂x(v) + ϕv * $∂y(v)
+            )
+            ds.p .= @. (γ - 1) * (u * $∂x(p) + v * $∂y(p)) - γ * ($∂x(pu) + $∂y(pv))
+
+            for apply_mod! in apply_modifier!s
+                apply_mod!(ds, s, t, (; ϕ⁻¹ = ϕ⁻¹, u = u, v = v))
+            end
+
+            nothing
+        end
     end
 end

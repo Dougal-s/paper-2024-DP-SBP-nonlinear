@@ -19,12 +19,15 @@ const state0 = let
 end
 
 const schemes = Dict(
-    "Flux Form"              => CompEulerFluxForm2D(γ = γ),
-    "Lax-Fried."             => CompEulerFluxForm2D(γ = γ, flux_splitting = FluxLaxFriedrichs()),
-    "Skew Symm. (γ=0)"       => NordstromCompEuler2D(γ = γ),
-    "Skew Symm. (γ>0)"       => NordstromCompEuler2D(γ = γ, flux_splitting = FluxEntropyStable()),
-    "Riess-Sesterhenn (γ=0)" => ReissSesterhennCompEuler2D(γ = γ),
+    "Flux Form"        => CompEulerFluxForm2D(; γ),
+    "Lax-Fried."       => CompEulerFluxForm2D(FluxLaxFriedrichs(); γ),
+    "van Leer-Hänel"   => CompEulerFluxForm2D(FluxVanLeerHanel(); γ),
+    "Skew Symm. (γ=0)" => NordstromCompEuler2D(; γ),
+    "Skew Symm. (γ>0)" => NordstromCompEuler2D(FluxDSL2025(); γ),
+    "Reiss-Sesterhenn" => ReissSesterhennCompEuler2D(; γ)
 )
+
+io = IOContext(stdout, :histmin => 0.5e6, :histmax => 10e6, :logbins => true)
 
 function run_benchmarks()
     allopts = dict_list(Dict(
@@ -38,24 +41,20 @@ function run_benchmarks()
         display(opts)
         println()
 
-        for gridsize in [(128, 128), (256, 256), (512, 512)]
-            println("grid\033[90m:\033[0m ", gridsize[begin], "×", gridsize[end])
+        for (K, N) in [(4, 65), (2, 129), (1, 257)]
+            println("grid\033[90m:\033[0m $(K)×$(K) elements, $(N)×$(N) nodes per element")
 
-            xs = map((dom, n) -> bounded_range(dom..., n), domain, gridsize)
-            (Dx₋, Dx₊, Hx), (Dy₋, Dy₊, Hy) = dp_operator.(
-                Ref(opts[:deriv_type]),
-                Ref(PeriodicSAT()),
-                Ref(opts[:deriv_order]),
-                xs
-            )
-            s₀ = meshgrid.(state0, Ref.(xs)...)
-            pde! = semidiscretise(pdeinfo, s₀, Dx₊, Dx₋, Dy₊, Dy₋)
+            mesh     = CartesianMesh(domain, (K, K))
+            cell     = local_dp_operator(opts[:deriv_type], opts[:deriv_order], (N, N))
+            xs, fdop = couple_operators(mesh, cell)
+            pde!     = semidiscretise(pdeinfo, xs, fdop)
 
-            s = from_primitive_vars(pdeinfo, s₀)
+            s₀ = map(f -> splat(f).(xs), state0)
+            s  = from_primitive_vars(pdeinfo, s₀)
             ds = similar(s)
 
             pde!(ds, s, (), 0.0)
-            display(@benchmark $pde!($ds, $s, (), 0.0))
+            show(io, MIME("text/plain"), @benchmark $pde!($ds, $s, (), 0.0))
             println()
         end
     end
@@ -64,23 +63,19 @@ end
 function run_static_analysis()
     allopts = dict_list(Dict(
         :scheme      => keys(schemes) |> collect,
-        :gridsize    => [(128, 128)],
         :deriv_order => 6,
         :deriv_type  => Mattsson2017
     ))
     for opts in allopts
         pdeinfo = schemes[opts[:scheme]]
 
-        xs = map((dom, n) -> bounded_range(dom..., n), domain, opts[:gridsize])
-        (Dx₋, Dx₊, Hx), (Dy₋, Dy₊, Hy) = dp_operator.(
-            Ref(opts[:deriv_type]),
-            Ref(PeriodicSAT()),
-            Ref(opts[:deriv_order]),
-            xs
-        )
-        s₀ = meshgrid.(state0, Ref.(xs)...)
-        pde! = semidiscretise(pdeinfo, s₀, Dx₊, Dx₋, Dy₊, Dy₋)
+        mesh     = CartesianMesh(domain, (1, 1))
+        cell     = local_dp_operator(opts[:deriv_type], opts[:deriv_order], (128, 128))
+        xs, fdop = couple_operators(mesh, cell)
 
+        pde! = semidiscretise(pdeinfo, xs, fdop)
+
+        s₀ = map(f -> splat(f).(xs), state0)
         s = from_primitive_vars(pdeinfo, s₀)
         ds = similar(s)
 

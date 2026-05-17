@@ -1,11 +1,9 @@
-using Symbolics
-using StaticArrays
+using HyperbolicPDEs: NullOperator
 using LinearAlgebra
-using RecursiveArrayTools: NamedArrayPartition
-using UnPack
 using NaNMath
-
-include(srcdir("pde-utils.jl"))
+using RecursiveArrayTools: NamedArrayPartition
+using StaticArrays
+using UnPack
 
 """
     ShallowWaterScheme{N, T <: Real, StateVars}
@@ -15,44 +13,22 @@ semidiscretisations with prognostic variables `StateVars`.
 """
 abstract type ShallowWaterScheme{N, T <: Real, StateVars} end;
 
-"""
-    global_cons_qtys(eq, (h, u[, v], b), Hx[, Hy])
-
-Get the following conserved global quantities from the primitive variables:
-    the total energy
-    the total mass
-    the total x momentum
-    [the total y momentum]
-"""
-function global_cons_qtys(eqs::ShallowWaterScheme{N}, state, H...) where {N}
-    @unpack g = eqs
-
-    total_energy(s) = energy_norm(s, H...) do (h, u..., b)
-        h * (1 // 2 * h + b) * g + 1 // 2 * h * (u ⋅ u)
-    end
-    total_mass(s)   = energy_norm(s, H...) do (h, u..., b)
-        h
-    end
-    total_ϱu(s)     = (energy_norm(s, H...) do (h, u..., b)
-        h * u[η]
-    end
-    for η in 1:N)
-
-    return (total_energy(state), total_mass(state), total_ϱu(state)...)
-end
-
 function to_primitive_vars(eqs::ShallowWaterScheme{N, T}, state) where {N, T}
-    dst = ntuple(_ -> Array{T}(undef, size(state.h)), 2 + N)
+    dst = ntuple(_ -> Array{T}(undef, size(state.h)), Val(2 + N))
     to_primitive_vars!(dst, eqs, state)
     return dst
 end
 
 @kwdef struct FluxLaxFriedrichs{T}
-    scaling::T = 1.0
+    volume::Bool  = true
+    surface::Bool = true
+    scaling::T    = 1.0
 end
 
 @kwdef struct FluxEntropyStable{T}
-    scaling::T = 1.0
+    volume::Bool  = true
+    surface::Bool = true
+    scaling::T    = 1.0
 end
 
 struct SourceMMS{T}
@@ -88,26 +64,37 @@ function to_primitive_vars!(dst, ::ShallowWaterScheme{1, T, (:h, :hu, :b)}, stat
 end
 
 function semidiscretise(info::ShallowWaterFluxForm1D{T}, grid, fdop;
-        alloc = () -> Array{T}(undef, length(grid))
+        alloc = () -> Array{T}(undef, size(grid))
 ) where {T}
     @unpack g = info
 
-    D₊, D₋ = fdop
-    D      = (D₋ + D₊) / 2
-    ∂x(m)  = D * m
+    D = (@unpack D, B = fdop[1]; D + B)
+    ∂x!(dst, m) = mul!(dst, D, m)
 
     apply_modifier!s = map(
         mod -> make_modifier(info, mod, grid, fdop, alloc), info.modifiers)
 
     fluxₕᵤ = alloc()
+    b² = alloc()
+    ∂ₓhu = alloc()
+    ∂ₓfluxₕᵤ = alloc()
+
+    ∂ₓb = alloc()
+    ∂ₓb² = alloc()
 
     (ds, s, _, t) -> begin
         @unpack h, hu, b = s
 
         @. fluxₕᵤ = hu^2 / h + 1 // 2 * g * h^2
+        @. b² = b^2
 
-        @. ds.h  = -$∂x(hu)
-        @. ds.hu = -$∂x(fluxₕᵤ) - g * (h + b) * $∂x(b) + 1 // 2 * g * $∂x(b^2)
+        ∂x!(∂ₓhu, hu)
+        ∂x!(∂ₓfluxₕᵤ, fluxₕᵤ)
+        ∂x!(∂ₓb, b)
+        ∂x!(∂ₓb², b²)
+
+        @. ds.h  = -∂ₓhu
+        @. ds.hu = -∂ₓfluxₕᵤ - g * (h + b) * ∂ₓb + 1 // 2 * g * ∂ₓb²
         @. ds.b  = $zero(T)
 
         for apply_mod! in apply_modifier!s
@@ -131,28 +118,39 @@ function ShallowWaterSkewSym1D(mods...; kwargs...)
 end
 
 function semidiscretise(info::ShallowWaterSkewSym1D{T}, grid, fdop;
-        alloc = () -> Array{T}(undef, length(grid))
+        alloc = () -> Array{T}(undef, size(grid))
 ) where {T}
     @unpack g = info
 
-    D₊, D₋ = fdop
-    D      = (D₋ + D₊) / 2
-    ∂x(m)  = D * m
+    D = (@unpack D, B = fdop[1]; D + B)
+    ∂x!(dst, m) = mul!(dst, D, m)
 
     apply_modifier!s = map(
         mod -> make_modifier(info, mod, grid, fdop, alloc), info.modifiers)
 
+    H   = alloc()
     u   = alloc()
     huu = alloc()
+
+    ∂ₓH = alloc()
+    ∂ₓu = alloc()
+    ∂ₓhu = alloc()
+    ∂ₓhuu = alloc()
 
     (ds, s, _, t) -> begin
         @unpack h, hu, b = s
 
+        @. H = h + b
         @. u = hu / h
         @. huu = hu * u
 
-        ds.h  .= @. -$∂x(hu)
-        ds.hu .= @. -1 // 2 * ($∂x(huu) + u * $∂x(hu) + hu * $∂x(u)) - g * h * $∂x(h) - g * h * $∂x(b)
+        ∂x!(∂ₓH, H)
+        ∂x!(∂ₓu, u)
+        ∂x!(∂ₓhu, hu)
+        ∂x!(∂ₓhuu, huu)
+
+        ds.h  .= @. -∂ₓhu
+        ds.hu .= @. -1 // 2 * (∂ₓhuu + u * ∂ₓhu + hu * ∂ₓu) - g * h * ∂ₓH
         ds.b  .= zero(T)
 
         for apply_mod! in apply_modifier!s
@@ -176,25 +174,21 @@ function make_modifier(
 ) where {T}
     @unpack g = eqs
 
-    D₊, D₋ = fdop
-    Dₛ     = (D₊ - D₋) / 2
-    ∂xs(f) = Dₛ * f
+    Diᵥ = splitting.volume ? splitting.scaling * fdop[1].Diᵥ : NullOperator()
+    Diₛ = splitting.surface ? splitting.scaling * fdop[1].Diₛ : NullOperator()
 
-    total_h = allocator()
+    H = allocator()
+    λ = allocator()
+    tmp = allocator()
 
     (ds, s, _) -> begin
         @unpack h, hu, b = s
 
-        λ = splitting.scaling * finitemaximum(zip(h, hu)) do (h, hu)
-            abs(hu / h) + NaNMath.sqrt(g * h)
-        end
+        @. λ = abs(hu / h) + NaNMath.sqrt(g * h)
+        @. H = h + b
 
-        @. total_h = h + b
-
-        @. ds.h  += λ * $∂xs(total_h)
-        @. ds.hu += λ * $∂xs(hu)
-
-        return nothing
+        add_splitting!(ds.h, Val(1), grid, Diᵥ, Diₛ, λ, H, tmp)
+        add_splitting!(ds.hu, Val(1), grid, Diᵥ, Diₛ, λ, hu, tmp)
     end
 end
 
@@ -207,31 +201,37 @@ function make_modifier(
 ) where {T}
     @unpack g = eqs
 
-    D₊, D₋ = fdop
-    Dₛ     = (D₊ - D₋) / 2
-    ∂xs(f) = Dₛ * f
+    Diᵥ = splitting.volume ? splitting.scaling * fdop[1].Diᵥ : NullOperator()
+    Diₛ = splitting.surface ? splitting.scaling * fdop[1].Diₛ : NullOperator()
 
     u  = allocator()
     gₕ = allocator()
 
+    λh  = allocator()
+    λhu = allocator()
+
+    tmp = allocator()
+
     (ds, s, _) -> begin
         @unpack h, hu, b = s
 
-        λh = 2 * finitemaximum(zip(h, hu)) do (h, hu)
-            h / (abs(hu / h) + NaNMath.sqrt(g * h))
+        @inbounds @simd ivdep for i in eachindex(h)
+            hᵢ, huᵢ, bᵢ = h[i], hu[i], b[i]
+
+            uᵢ  = huᵢ / hᵢ
+            c = NaNMath.sqrt(g * hᵢ)
+            a = abs(uᵢ) + c
+
+            gₕ[i] = g * (hᵢ + bᵢ / 2) - uᵢ^2 / 2
+            u[i] = uᵢ
+
+            # λh[i]  = 6(c / g)
+            λh[i]  = 8a * hᵢ / (hᵢ * g + uᵢ^2)
+            λhu[i] = 8a * hᵢ
         end
-        λhu = 4 * finitemaximum(zip(h, hu)) do (h, hu)
-            abs(hu) + 1 // 2 * abs(h) * NaNMath.sqrt(g * h)
-        end
-        λh, λhu = splitting.scaling .* (λh, λhu)
 
-        @. u  = hu / h
-        @. gₕ = g * (h + b) - 1 // 2 * u^2
-
-        @. ds.h  += λh * $∂xs(gₕ)
-        @. ds.hu += λhu * $∂xs(u)
-
-        return nothing
+        add_splitting!(ds.h, Val(1), grid, Diᵥ, Diₛ, λh, gₕ, tmp)
+        add_splitting!(ds.hu, Val(1), grid, Diᵥ, Diₛ, λhu, u, tmp)
     end
 end
 
@@ -279,17 +279,18 @@ function to_primitive_vars!(
 end
 
 function semidiscretise(info::ShallowWaterFluxForm2D{T}, grid, fdop;
-        alloc = () -> Array{T}(undef, length.(grid)...)
+        alloc = () -> Array{T}(undef, size(grid))
 ) where {T}
     @unpack modifiers, g, f = info
 
-    (Dx₊, Dx₋), (Dy₊, Dy₋) = fdop
-    Dx = (Dx₋ + Dx₊) / 2
-    Dy = (Dy₋ + Dy₊) / 2
-
     mempool = MemoryPool(alloc())
-    ∂x(m)   = ∂x2D(mempool, Dx, m)
-    ∂y(m)   = ∂y2D(mempool, Dy, m)
+    permute_cache = alloc()
+
+    Dx = (@unpack D, B = fdop[1]; D + B)
+    ∂x(m) = axis_mul!(mempool, Val(1), Dx, m, permute_cache)
+
+    Dy = (@unpack D, B = fdop[2]; D + B)
+    ∂y(m) = axis_mul!(mempool, Val(2), Dy, m, permute_cache)
 
     apply_modifier!s = map(
         mod -> make_modifier(info, mod, grid, fdop, alloc, mempool), info.modifiers)
@@ -297,6 +298,7 @@ function semidiscretise(info::ShallowWaterFluxForm2D{T}, grid, fdop;
     fluxˣₕᵤ = alloc()
     huv     = alloc()
     fluxʸₕᵥ = alloc()
+    b²      = alloc()
 
     (ds, s, _, t) -> begin
         returnblocks(mempool)
@@ -305,17 +307,24 @@ function semidiscretise(info::ShallowWaterFluxForm2D{T}, grid, fdop;
         @. fluxˣₕᵤ = hu * hu / h + 1 // 2 * g * h^2
         @. fluxʸₕᵥ = hv * hv / h + 1 // 2 * g * h^2
         @. huv = hu * hv / h
+        @. b²  = b^2
 
         @. ds.h  = -$∂x(hu) - $∂y(hv)
-        @. ds.hu = -$∂x(fluxˣₕᵤ) - $∂y(huv) + f * hv - g * h * $∂x(b)
-        @. ds.hv = -$∂x(huv) - $∂y(fluxʸₕᵥ) - f * hu - g * h * $∂y(b)
+        @. ds.hu = (-$∂x(fluxˣₕᵤ) - $∂y(huv)
+            + f * hv
+            - g * (h + b) * $∂x(b) + 1 // 2 * g * $∂x(b²)
+        )
+        @. ds.hv = (-$∂x(huv) - $∂y(fluxʸₕᵥ)
+            - f * hu
+            - g * (h + b) * $∂y(b) + 1 // 2 * g * $∂y(b²)
+        )
         @. ds.b  = $zero(T)
 
         for apply_mod! in apply_modifier!s
             apply_mod!(ds, s, t)
         end
 
-        return nothing
+        return
     end
 end
 
@@ -352,17 +361,18 @@ function to_primitive_vars!(dst, ::ShallowWaterVectorInv2D, state)
 end
 
 function semidiscretise(info::ShallowWaterVectorInv2D{T}, grid, fdop;
-        alloc = () -> Array{T}(undef, length.(grid)...)
+        alloc = () -> Array{T}(undef, size(grid))
 ) where {T}
     @unpack modifiers, g, f = info
 
-    (Dx₊, Dx₋), (Dy₊, Dy₋) = fdop
-    Dx = (Dx₋ + Dx₊) / 2
-    Dy = (Dy₋ + Dy₊) / 2
-
     mempool = MemoryPool(alloc())
-    ∂x(m)   = ∂x2D(mempool, Dx, m)
-    ∂y(m)   = ∂y2D(mempool, Dy, m)
+    permute_cache = alloc()
+
+    Dx = (@unpack D, B = fdop[1]; D + B)
+    ∂x(m) = axis_mul!(mempool, Val(1), Dx, m, permute_cache)
+
+    Dy = (@unpack D, B = fdop[2]; D + B)
+    ∂y(m) = axis_mul!(mempool, Val(2), Dy, m, permute_cache)
 
     apply_modifier!s = map(
         mod -> make_modifier(info, mod, grid, fdop, alloc, mempool), info.modifiers)
@@ -415,17 +425,18 @@ function ShallowWaterSkewSym2D(mods...; kwargs...)
 end
 
 function semidiscretise(info::ShallowWaterSkewSym2D{T}, grid, fdop;
-        alloc = () -> Array{T}(undef, length.(grid)...)
+        alloc = () -> Array{T}(undef, size(grid))
 ) where {T}
     @unpack modifiers, g, f = info
 
-    (Dx₊, Dx₋), (Dy₊, Dy₋) = fdop
-    Dx = (Dx₋ + Dx₊) / 2
-    Dy = (Dy₋ + Dy₊) / 2
-
     mempool = MemoryPool(alloc())
-    ∂x(m)   = ∂x2D(mempool, Dx, m)
-    ∂y(m)   = ∂y2D(mempool, Dy, m)
+    permute_cache = alloc()
+
+    Dx = (@unpack D, B = fdop[1]; D + B)
+    ∂x(m) = axis_mul!(mempool, Val(1), Dx, m, permute_cache)
+
+    Dy = (@unpack D, B = fdop[2]; D + B)
+    ∂y(m) = axis_mul!(mempool, Val(2), Dy, m, permute_cache)
 
     apply_modifier!s = map(
         mod -> make_modifier(info, mod, grid, fdop, alloc, mempool), info.modifiers)
@@ -436,6 +447,9 @@ function semidiscretise(info::ShallowWaterSkewSym2D{T}, grid, fdop;
     hvv = alloc()
     u   = alloc()
     v   = alloc()
+
+    ∂x_hu = alloc()
+    ∂y_hv = alloc()
 
     (ds, s, _, t) -> begin
         returnblocks(mempool)
@@ -449,15 +463,18 @@ function semidiscretise(info::ShallowWaterSkewSym2D{T}, grid, fdop;
         @. huv = hu * v
         @. hvv = hv * v
 
-        @. ds.h = -$∂x(hu) - $∂y(hv)
+        @. ∂x_hu = $∂x(hu)
+        @. ∂y_hv = $∂y(hv)
 
-        @. ds.hu = -1 // 2 * ($∂x(huu) + u * $∂x(hu) + hu * $∂x(u)) -
-                   1 // 2 * ($∂y(huv) + u * $∂y(hv) + hv * $∂y(u)) -
+        @. ds.h = -∂x_hu - ∂y_hv
+
+        @. ds.hu = -1 // 2 * ($∂x(huu) + u * ∂x_hu + hu * $∂x(u)) -
+                   1 // 2 * ($∂y(huv) + u * ∂y_hv + hv * $∂y(u)) -
                    g * h * $∂x(H) +
                    f * hv
 
-        @. ds.hv = -1 // 2 * ($∂x(huv) + v * $∂x(hu) + hu * $∂x(v)) -
-                   1 // 2 * ($∂y(hvv) + v * $∂y(hv) + hv * $∂y(v)) -
+        @. ds.hv = -1 // 2 * ($∂x(huv) + v * ∂x_hu + hu * $∂x(v)) -
+                   1 // 2 * ($∂y(hvv) + v * ∂y_hv + hv * $∂y(v)) -
                    g * h * $∂y(H) -
                    f * hu
 
@@ -475,8 +492,8 @@ end
 # MMS #
 #######
 
-⊥(u::SVector{2}) = SVector{2}(-u[2], u[1])
-⊥(u::SVector{1}) = SVector{1}(zero(u))
+⊥(u::NTuple{2}) = (-u[2], u[1])
+⊥(::NTuple{1}) = (false,)
 
 function make_modifier(
         info::ShallowWaterScheme{N, T, StateVars},
@@ -484,34 +501,33 @@ function make_modifier(
         grid,
         _...
 ) where {N, T, StateVars}
-    @variables t x[1:N]
-    h, 𝐮..., b = Ref((t, x...)) .|> Base.splat.(mms.exact)
-    𝐮 = SVector{N}(𝐮)
+    ∂t = SymUtils.∂t
+    ∇  = ntuple(i -> SymUtils.SpatialDerivative{i}(), Val(N))
+    ∀  = Base.Fix{2}(ntuple, Val(N))
+
+    h, v⃗..., b = SymUtils.LazyField.(mms.exact)
 
     g = info.g
-    f = N == 2 ? info.f : 0
+    f = N == 2 ? info.f : false
 
-    h𝐮 = h * 𝐮
-    hu_sym = [:hu, :hv][1:N]
-    u_sym = [:u, :v][1:N]
+    hv⃗ = h .* v⃗
+    ω = ∇ ⋅ ⊥(v⃗) + f
+    G = v⃗ ⋅ v⃗ / 2 + g * h
 
-    ∂x = [Differential(xᵢ) for xᵢ in x]
-    ∇  = VectorOperator(∂x)
-    ∂t = Differential(t)
+    hv⃗_sym = [:hu, :hv][1:N]
+    v⃗_sym = [:u, :v][1:N]
 
-    ω = ∇ ⋅ ⊥(𝐮) + f
-    G = 𝐮 ⋅ 𝐮 / 2 + g * h
+    eqs_hv⃗ = ∀(i -> ∂t(hv⃗[i]) + ∇ ⋅ (hv⃗[i] .* v⃗) + g * h * ∇[i](h + b) + f * ⊥(hv⃗)[i])
+    eqs_v⃗  = ∀(i -> ∂t(v⃗[i]) + ω * ⊥(v⃗)[i] + ∇[i]G)
 
-    #! format: off
-    eqs = Dict(
-        :h       => ∂t(h)   + ∇ ⋅ h𝐮,
-        (hu_sym .=> ∂t.(h𝐮) + ∇ ⋅ (h𝐮 * 𝐮') + g * h * ∇(h + b) + f * ⊥(h𝐮) )...,
-        (u_sym  .=> ∂t.(𝐮)  + ω * ⊥(𝐮) + ∇(G) )...,
-        :b       => ∂t(b)
+    eqs = (;
+        h = ∂t(h) + ∇ ⋅ hv⃗,
+        b = ∂t(b),
+        (@. hv⃗_sym => eqs_hv⃗)...,
+        (@. v⃗_sym => eqs_v⃗)...
     )
-    #! format: on
 
-    make_source_modifier_from_syms(StateVars, eqs, grid)
+    SymUtils.make_source_modifier_from_syms(StateVars, eqs, grid)
 end
 
 ###################
@@ -528,28 +544,32 @@ function make_modifier(
 ) where {T}
     @unpack g = eqs
 
-    (Dx₊, Dx₋), (Dy₊, Dy₋) = fdop
-    Dx_split = (Dx₊ - Dx₋) / 2
-    Dy_split = (Dy₊ - Dy₋) / 2
+    tmp = alloc()
+    permute_cache = alloc()
 
-    ∂xs(f) = ∂x2D(mempool, Dx_split, f)
-    ∂ys(f) = ∂y2D(mempool, Dy_split, f)
+    Dixᵥ = (splitting.volume ? splitting.scaling * fdop[1].Diᵥ : NullOperator())
+    Dixₛ = (splitting.surface ? splitting.scaling * fdop[1].Diₛ : NullOperator())
+    Diyᵥ = (splitting.volume ? splitting.scaling * fdop[2].Diᵥ : NullOperator())
+    Diyₛ = (splitting.surface ? splitting.scaling * fdop[2].Diₛ : NullOperator())
+
+    H = alloc()
+    λ = ntuple(_ -> alloc(), Val(2))
 
     (ds, s, t) -> begin
         @unpack h, hu, hv, b = s
 
-        λx = zero(T)
-        λy = zero(T)
+        @. H = h + b
+
         @inbounds for i in eachindex(h)
             p = NaNMath.sqrt(g * h[i])
-            λx = NaNMath.max(λx, abs(hu[i] / h[i]) + p)
-            λy = NaNMath.max(λy, abs(hv[i] / h[i]) + p)
+            λ[1][i] = abs(hu[i] / h[i]) + p
+            λ[2][i] = abs(hv[i] / h[i]) + p
         end
-        λx, λy = splitting.scaling .* (λx, λy)
 
-        @. ds.h  += λx * $∂xs(h) + λy * $∂ys(h)
-        @. ds.hu += λx * $∂xs(hu) + λy * $∂ys(hu)
-        @. ds.hv += λx * $∂xs(hv) + λy * $∂ys(hv)
+        for (dqdt, q) in ((ds.h, H), (ds.hu, hu), (ds.hv, hv))
+            add_splitting!(dqdt, Val(1), grid, Dixᵥ, Dixₛ, λ[1], q, tmp, permute_cache)
+            add_splitting!(dqdt, Val(2), grid, Diyᵥ, Diyₛ, λ[2], q, tmp, permute_cache)
+        end
     end
 end
 
@@ -563,42 +583,53 @@ function make_modifier(
 ) where {T}
     @unpack g = eqs
 
-    (Dx₊, Dx₋), (Dy₊, Dy₋) = fdop
-    Dx_split = (Dx₊ - Dx₋) / 2
-    Dy_split = (Dy₊ - Dy₋) / 2
+    tmp = alloc()
+    permute_cache = alloc()
 
-    ∂xs(f) = ∂x2D(mempool, Dx_split, f)
-    ∂ys(f) = ∂y2D(mempool, Dy_split, f)
+    Dixᵥ = (splitting.volume ? splitting.scaling * fdop[1].Diᵥ : NullOperator())
+    Dixₛ = (splitting.surface ? splitting.scaling * fdop[1].Diₛ : NullOperator())
+    Diyᵥ = (splitting.volume ? splitting.scaling * fdop[2].Diᵥ : NullOperator())
+    Diyₛ = (splitting.surface ? splitting.scaling * fdop[2].Diₛ : NullOperator())
 
     u  = alloc()
     v  = alloc()
     gh = alloc()
 
+    λhs  = ntuple(_ -> alloc(), 2)
+    λhus = ntuple(_ -> alloc(), 2)
+    λhvs = ntuple(_ -> alloc(), 2)
+
     (ds, s, t) -> begin
         @unpack h, hu, hv, b = s
 
-        @. u  = hu / h
-        @. v  = hv / h
-        @. gh = g * (h + b) - 1 // 2 * (u^2 + v^2)
+        @inbounds @simd ivdep for i in eachindex(h)
+            hᵢ, hv⃗ᵢ, bᵢ = h[i], @SVector[hu[i], hv[i]], b[i]
 
-        λh   = zero(T) # s
-        λh𝐮₌ = zero(T) # m²s⁻¹
-        λh𝐮₊ = zero(T) # m²s⁻¹
-        @inbounds for i in eachindex(h)
-            p = NaNMath.sqrt(g * h[i])
-            c = hypot(u[i], v[i]) + p
+            v⃗ᵢ = hv⃗ᵢ / hᵢ
+            aᵢ  = abs.(v⃗ᵢ) .+ NaNMath.sqrt(g * hᵢ)
 
-            λh   = NaNMath.max(λh, h[i] / c)
-            λh𝐮₌ = NaNMath.max(λh𝐮₌, h[i] * (c - 1 // 2 * p))
-            λh𝐮₊ = NaNMath.max(λh𝐮₊, abs(hv[i] * hu[i]))
+            λhsᵢ = aᵢ * hᵢ / (hᵢ * g + v⃗ᵢ ⋅ v⃗ᵢ)
+            λhusᵢ = aᵢ * hᵢ
+            λhvsᵢ = aᵢ * hᵢ
+
+            u[i], v[i]  = hv⃗ᵢ / hᵢ
+            gh[i] = g * (hᵢ + bᵢ) - 1 // 2 * v⃗ᵢ ⋅ v⃗ᵢ
+
+            for d in 1:2
+                λhs[d][i]  = λhsᵢ[d]
+                λhus[d][i] = λhusᵢ[d]
+                λhvs[d][i] = λhvsᵢ[d]
+            end
         end
-        λh   = 2λh * splitting.scaling
-        λh𝐮₌ = 4λh𝐮₌ * splitting.scaling
-        λh𝐮₊ = 4√λh𝐮₊ * splitting.scaling
 
-        @. ds.h  += λh * $∂xs(gh) + λh * $∂ys(gh)
-        @. ds.hu += λh𝐮₌ * $∂xs(u) + λh𝐮₊ * $∂ys(u)
-        @. ds.hv += λh𝐮₊ * $∂xs(v) + λh𝐮₌ * $∂ys(v)
+        add_splitting!(ds.h, Val(1), grid, Dixᵥ, Dixₛ, λhs[1], gh, tmp, permute_cache)
+        add_splitting!(ds.h, Val(2), grid, Diyᵥ, Diyₛ, λhs[2], gh, tmp, permute_cache)
+
+        add_splitting!(ds.hu, Val(1), grid, Dixᵥ, Dixₛ, λhus[1], u, tmp, permute_cache)
+        add_splitting!(ds.hu, Val(2), grid, Diyᵥ, Diyₛ, λhus[2], u, tmp, permute_cache)
+
+        add_splitting!(ds.hv, Val(1), grid, Dixᵥ, Dixₛ, λhvs[1], v, tmp, permute_cache)
+        add_splitting!(ds.hv, Val(2), grid, Diyᵥ, Diyₛ, λhvs[2], v, tmp, permute_cache)
     end
 end
 
@@ -612,12 +643,14 @@ function make_modifier(
 ) where {T}
     @unpack g = eqs
 
-    (Dx₊, Dx₋), (Dy₊, Dy₋) = fdop
-    Dx_split = (Dx₊ - Dx₋) / 2
-    Dy_split = (Dy₊ - Dy₋) / 2
+    permute_cache = alloc()
+    Dxₛ = splitting.scaling * ((splitting.volume ? fdop[1].Diᵥ : NullOperator()) +
+                               (splitting.surface ? fdop[1].Diₛ : NullOperator()))
+    ∂xs(m) = axis_mul!(mempool, Val(1), Dxₛ, m, permute_cache)
 
-    ∂xs(f) = ∂x2D(mempool, Dx_split, f)
-    ∂ys(f) = ∂y2D(mempool, Dy_split, f)
+    Dyₛ = splitting.scaling * ((splitting.volume ? fdop[2].Diᵥ : NullOperator()) +
+                               (splitting.surface ? fdop[2].Diₛ : NullOperator()))
+    ∂ys(m) = axis_mul!(mempool, Val(2), Dyₛ, m, permute_cache)
 
     hu = alloc()
     hv = alloc()
@@ -637,7 +670,6 @@ function make_modifier(
             α = max(α, c / (2h[i]))
             β = max(β, g / (2c))
         end
-        α, β = splitting.scaling .* (α, β)
 
         @. ds.h += α * ($∂xs(G) + $∂ys(G))
         @. ds.u += β * ($∂xs(hu) + $∂ys(hu))

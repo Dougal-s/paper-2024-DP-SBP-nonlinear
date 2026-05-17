@@ -46,20 +46,7 @@ recommended to run them with the `--threads auto` flag set to multithreaded
 execution.
 
 
-### System Image Compilation
-
-Due to the number of scripts, it may be desirable to reduce the time to first
-execution by generating a custom system image using
-[PackageCompiler.jl](https://github.com/JuliaLang/PackageCompiler.jl). This can
-be done by executing the script `compile/compile.sh`. *Note that on my
-machine, this took ~5min and used all 16gb of available memory.* Once the
-system image has been generated, scripts can be run using:
-
-```
-julia -Jpath/to/sysimage.so path/to/script.jl
-```
-
 ## Authors
- - Kenneth Duru (University of Texas at El Paso, US; Australian National University, Canberra, Australia)
- - Dougal Stewart (University of Melbourne, Australia)
+ - Kenneth Duru (University of Texas at El Paso, US)
+ - Dougal Stewart (Monash University, Australia)
  - Nathan Lee (University of New South Wales, Australia)

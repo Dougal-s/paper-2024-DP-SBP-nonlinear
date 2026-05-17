@@ -1,4 +1,4 @@
-using Symbolics
+using HyperbolicPDEs: NullOperator
 using UnPack: @unpack
 
 """
@@ -9,60 +9,42 @@ with prognostic variables `StateVars`.
 """
 abstract type Burgers1DScheme{StateVars} end;
 
-"""
-    global_cons_qtys(eq, (u, ), Hx)
-
-Get the following conserved global quantities from the primitive variables:
-    the total energy (u^2),
-    the total velocity (u).
-"""
-function global_cons_qtys(eqs::Burgers1DScheme, state, Hx)
-    total_energy(s) =
-        energy_norm(s, Hx) do (u,)
-            u^2
-        end
-    total_velocity(s) =
-        energy_norm(s, Hx) do (u,)
-            u
-        end
-
-    return (total_energy(state), total_velocity(state))
-end
-
 function to_primitive_vars(eqs::Burgers1DScheme, state)
     dst = (similar(state),)
     to_primitive_vars!(dst, eqs, state)
     return dst
 end
 
+(S::Type{<:Burgers1DScheme})(mods...; kwargs...) = S(; modifiers = Tuple(mods), kwargs...)
+
+from_primitive_vars(::Burgers1DScheme{(:u,)}, (u,)) = u
+
+function to_primitive_vars!(dst, ::Burgers1DScheme{(:u,)}, u)
+    dst[1] .= u
+    return
+end
+
+
 #######################
 # 1D Burgers Equation #
 #######################
 
-@kwdef struct BurgersFluxForm1D{Modifiers<:Tuple} <: Burgers1DScheme{(:u,)}
+@kwdef struct BurgersFluxForm1D{Modifiers <: Tuple} <: Burgers1DScheme{(:u,)}
     modifiers::Modifiers = ()
 end
 
-function BurgersFluxForm1D(mods...; kwargs...)
-    BurgersFluxForm1D(; modifiers=Tuple(mods), kwargs...)
-end
-
-from_primitive_vars(::BurgersFluxForm1D, (u,)) = u
-
-function to_primitive_vars!(dst, ::BurgersFluxForm1D, u)
-    dst[1] .= u
-    return ()
-end
-
-function semidiscretise(info::BurgersFluxForm1D, xs, fdop)
-    D₊, D₋ = fdop
-    D = (D₋ + D₊) / 2
+function semidiscretise(info::BurgersFluxForm1D, xs, fdop;
+        alloc = () -> Array{Float64}(undef, size(xs))
+)
+    D = (@unpack D, B = fdop[1]; D + B)
     ∂x(m) = D * m
 
-    apply_modifier!s = map(mod -> make_modifier(info, mod, xs, fdop), info.modifiers)
+    apply_modifier!s = map(mod -> make_modifier(info, mod, xs, fdop, alloc), info.modifiers)
 
+    f = alloc()
     (du, u, _, t::Real) -> begin
-        @. du = -1 // 2 * $∂x(u^2)
+        @. f = u^2 / 2
+        @. du = -$∂x(f)
 
         for apply_mod! in apply_modifier!s
             apply_mod!(du, u, t)
@@ -74,36 +56,58 @@ end
 
 """
 """
-@kwdef struct BurgersSkewSym1D{Modifiers<:Tuple} <: Burgers1DScheme{(:u,)}
+@kwdef struct BurgersSkewSym1D{Modifiers <: Tuple} <: Burgers1DScheme{(:u,)}
     modifiers::Modifiers = ()
 end
 
-function BurgersSkewSym1D(mods...; kwargs...)
-    BurgersSkewSym1D(; modifiers=Tuple(mods), kwargs...)
-end
-
-from_primitive_vars(::BurgersSkewSym1D, (u,)) = u
-
-function to_primitive_vars!(dst, ::BurgersSkewSym1D, u)
-    dst[1] .= u
-    return ()
-end
-
-function semidiscretise(info::BurgersSkewSym1D, xs, fdop)
-    D₊, D₋ = fdop
-    D = (D₋ + D₊) / 2
+function semidiscretise(info::BurgersSkewSym1D, xs, fdop;
+        alloc = () -> Array{Float64}(undef, size(xs))
+)
+    D = (@unpack D, B = fdop[1]; D + B)
     ∂x(m) = D * m
 
-    apply_modifier!s = map(mod -> make_modifier(info, mod, xs, fdop), info.modifiers)
+    apply_modifier!s = map(mod -> make_modifier(info, mod, xs, fdop, alloc), info.modifiers)
+
+    u² = alloc()
 
     (du, u, _, t::Real) -> begin
-        @. du = -1 / 3 * u * $∂x(u) - $∂x(u^2) / 3
+        @. u² = u^2
+        @. du = -1 / 3 * u * $∂x(u) - $∂x(u²) / 3
 
         for apply_mod! in apply_modifier!s
             apply_mod!(du, u, t)
         end
 
         return nothing
+    end
+end
+
+"""
+The Advective form of burgers equation
+```math
+    ∂ₜ u + u ∂ₓ u = 0.
+```
+"""
+@kwdef struct BurgersAdvective1D{Modifiers <: Tuple} <: Burgers1DScheme{(:u,)}
+    modifiers::Modifiers = ()
+end
+
+function semidiscretise(info::BurgersAdvective1D, xs, fdop;
+        alloc = () -> Array{Float64}(undef, size(xs))
+)
+    D = (@unpack D, B = fdop[1]; D + B)
+    ∂x(m) = D * m
+
+    apply_modifier!s = map(mod -> make_modifier(info, mod, xs, fdop, alloc), info.modifiers)
+
+    (du, u, _, t::Real) -> begin
+        @. du = -u * $∂x(u)
+
+        for apply_mod! in apply_modifier!s
+            apply_mod!(du, u, t)
+        end
+
+        return
     end
 end
 
@@ -115,26 +119,17 @@ struct SourceMMS{T}
     exact::T
 end
 
-function make_modifier(::Burgers1DScheme{(:u,)}, mms::SourceMMS, xs, fdop)
-    @variables t x
-    u, = map(exact -> exact(t, x), mms.exact)
-    ∂x = Differential(x)
-    ∂t = Differential(t)
+function make_modifier(::Burgers1DScheme{(:u,)}, mms::SourceMMS, grid, _...)
+    ∂t = SymUtils.∂t
+    ∂x = SymUtils.SpatialDerivative{1}()
+    u, = SymUtils.LazyField.(mms.exact)
 
-    source_term_sym = ∂t(u) + u * ∂x(u)
-    source_term = (Symbolics.toexpr ∘ simplify ∘ expand_derivatives)(source_term_sym)
-    add_source_terms! = eval(quote
-        (du, t::Real) -> begin
-            for (i, x) in enumerate($xs)
-                du[i] += $(source_term)
-            end
-            return nothing
-        end
-    end)
-
+    source_term = ∂t(u) + u * ∂x(u)
+    xs = collect(grid)
     return (ds, s, t::Real, _...) -> begin
-        @invokelatest add_source_terms!(ds, t)
-        return nothing
+        @inbounds @simd ivdep for i in eachindex(xs)
+            ds[i] += source_term(t, xs[i])
+        end
     end
 end
 
@@ -143,26 +138,70 @@ end
 ###################
 
 @kwdef struct FluxLaxFriedrichs{T}
-    scaling::T = 1.0
+    volume::Bool  = true
+    surface::Bool = true
+    scaling::T    = 1.0
 end
+"""
+    FluxEntropyStable{T}
+
+An entropy stable flux splitting with respect to the kinetic energy/square entropy
+``η(u) = ½u²``.
+"""
 @kwdef struct FluxEntropyStable{T}
-    scaling::T = 1.0
+    volume::Bool  = true
+    surface::Bool = true
+    scaling::T    = 1.0
+end
+"""
+    FluxLogEntropyStable{T}
+
+An entropy stable flux splitting with respect to the log entropy ``η(u) = -\\log(u)``.
+"""
+@kwdef struct FluxLogEntropyStable{T}
+    volume::Bool  = true
+    surface::Bool = true
+    scaling::T    = 1.0
 end
 
 function make_modifier(
-    ::Burgers1DScheme{(:u,)},
-    splitting::Union{FluxLaxFriedrichs,FluxEntropyStable},
-    xs,
-    fdop
+        ::Burgers1DScheme{(:u,)},
+        splitting::Union{FluxLaxFriedrichs, FluxEntropyStable},
+        grid,
+        fdop,
+        alloc
 )
-    D₊, D₋ = fdop
-    Dₛ = (D₊ - D₋) / 2
-    ∂xs(f) = Dₛ * f
+    Diᵥ = (splitting.volume ? splitting.scaling * fdop[1].Diᵥ : NullOperator())
+    Diₛ = (splitting.surface ? splitting.scaling * fdop[1].Diₛ : NullOperator())
+
+    tmp = alloc()
+    λ = alloc()
 
     (du, u, _) -> begin
-        γ = splitting.scaling * maximum(abs, u)
-        @. du += γ * $∂xs(u)
+        @. λ = abs(u)
+        add_splitting!(du, Val(1), grid, Diᵥ, Diₛ, λ, u, tmp)
+    end
+end
 
-        return nothing
+function make_modifier(
+        ::Burgers1DScheme{(:u,)},
+        splitting::FluxLogEntropyStable,
+        grid,
+        fdop,
+        alloc
+)
+    Diᵥ = (splitting.volume ? splitting.scaling * fdop[1].Diᵥ : NullOperator())
+    Diₛ = (splitting.surface ? splitting.scaling * fdop[1].Diₛ : NullOperator())
+
+    tmp = alloc()
+    λ = alloc()
+    r = alloc()
+
+    # -∂ₓ u⁻¹ = u⁻² ∂ₓ u
+
+    (du, u, _) -> begin
+        @. r = -inv(u)
+        @. λ = abs(u)^3
+        add_splitting!(du, Val(1), grid, Diᵥ, Diₛ, λ, r, tmp)
     end
 end
